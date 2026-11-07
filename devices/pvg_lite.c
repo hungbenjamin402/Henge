@@ -56,6 +56,8 @@ struct HvPvgLite {
     uint64_t display_pa;
     uint32_t display_seq;   /* the mode list's sequence number the guest was last told */
     uint32_t mode_acked;    /* the sequence number the guest last acked */
+    uint64_t offered[8];    /* the mode told as each recent sequence number (seq % 8), packed by mode_packed */
+    uint64_t accepted;      /* the mode of the sequence number last acked, or the boot mode; 0 before a page */
     uint64_t swaps;
     /* The last stamp handed to the worker per channel, and who is being drained. */
     uint32_t submitted[MAX_CHANNELS];
@@ -161,6 +163,11 @@ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm) {
     display_mm_h = height_mm;
 }
 
+/* The mode being offered as one value: width, height, and whether it is a monitor's (a physical size). */
+static uint64_t mode_packed(void) {
+    return (uint64_t)display_w | (uint64_t)display_h << 24 | (uint64_t)(display_mm_w != 0) << 48;
+}
+
 #define PUT32(off, v) (*(uint32_t *)(d + (off)) = (uint32_t)(v))
 #define PUTF(off, v) (*(float *)(d + (off)) = (v))
 
@@ -186,6 +193,8 @@ static void display_set_page(HvPvgLite *p, uint64_t pa) {
     p->display_pa = pa;
     p->display_seq = 1;
     p->mode_acked = 0;
+    p->offered[1] = mode_packed();
+    __atomic_store_n(&p->accepted, p->offered[1], __ATOMIC_RELEASE); /* macOS takes the boot mode as given */
     PUT32(0x00, 1);
     PUT32(0x18, 0x01000100);
     PUT32(0x1c, 0x400);
@@ -205,6 +214,7 @@ void hv_pvg_lite_request_mode(HvPvgLite *p, uint32_t width, uint32_t height, uin
     uint8_t *d = p && p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
     if (!d) return; /* not booted yet: the page the guest names will carry it */
     display_offer_modes(d, ++p->display_seq);
+    p->offered[p->display_seq % 8] = mode_packed();
     /* The display's event bit, then the interrupt: the guest's handler reads +1014 and the page. */
     p->regs[(0x1014 - 0x1000) / 4] |= 1;
     hv_gicv3_pend(p->gic, p->gfx_irq);
@@ -214,6 +224,12 @@ void hv_pvg_lite_request_mode(HvPvgLite *p, uint32_t width, uint32_t height, uin
 
 uint32_t hv_pvg_lite_mode_acked(HvPvgLite *p) {
     return p ? __atomic_load_n(&p->mode_acked, __ATOMIC_ACQUIRE) : 0;
+}
+
+void hv_pvg_lite_accepted_mode(HvPvgLite *p, uint32_t *width, uint32_t *height, int *monitor) {
+    uint64_t m = p ? __atomic_load_n(&p->accepted, __ATOMIC_ACQUIRE) : 0;
+    if (!m) m = mode_packed(); /* no page yet: the mode it will boot with */
+    *width = (uint32_t)(m & 0xffffff), *height = (uint32_t)(m >> 24 & 0xffffff), *monitor = (int)(m >> 48 & 1);
 }
 
 #undef PUT32
@@ -226,6 +242,8 @@ static void display_ack(HvPvgLite *p, uint32_t seq) {
     d[0xfa9] = 0;
     *(uint32_t *)(d + 0xfc0) = 2;
     __atomic_store_n(&p->mode_acked, seq, __ATOMIC_RELEASE);
+    if (seq && seq <= p->display_seq && p->display_seq - seq < 8) /* one still remembered */
+        __atomic_store_n(&p->accepted, p->offered[seq % 8], __ATOMIC_RELEASE);
     if (seq > 1) fprintf(stderr, "hengevm: pvg-lite: display mode seq %u acked by the guest\n", seq);
 }
 

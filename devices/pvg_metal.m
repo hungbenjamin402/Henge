@@ -17,7 +17,9 @@
 #include <string.h>
 #include <sys/utsname.h>
 
-/* 1080p shrunk onto a phone would make a normal pointer a few dots across; an iPad's screen needs less. */
+/* The pointer's enlargement on the device's own screen (the cursor plan's phone_scale; a monitor
+   gets the guest's own size): 1080p shrunk onto a phone would make a normal pointer a few dots
+   across; an iPad's screen needs less. */
 static int cursor_scale(void) {
 #if TARGET_OS_IPHONE
     NSInteger saved = [[NSUserDefaults standardUserDefaults] integerForKey:@"henge.cursor.scale"];
@@ -44,6 +46,15 @@ static int cursor_scale(void) {
 
 #include "pvg_lite.h"
 #include "pvg_present.h"
+
+/* Where the pointer is drawn on a W x H frame, for both drawing paths (pvg_present.h): `where` is
+   the display page's +0xe00, in the pixels of the mode the guest accepted. */
+static HvCursorPlan cursor_plan_now(HvPvgLite *lite, uint32_t W, uint32_t H, uint32_t where, uint32_t gw, uint32_t gh, int hx, int hy) {
+    uint32_t mode_w, mode_h;
+    int monitor;
+    hv_pvg_lite_accepted_mode(lite, &mode_w, &mode_h, &monitor);
+    return hv_cursor_plan(W, H, mode_w, mode_h, where & 0xffff, where >> 16, gw, gh, hx, hy, monitor, (uint32_t)cursor_scale());
+}
 
 #if !TARGET_OS_IPHONE
 #import <CoreGraphics/CoreGraphics.h>
@@ -1865,10 +1876,9 @@ static const uint8_t *half_to_byte(void) {
         last = where;
     }
     if (where == 0xffffffff) return;
-    /* Bigger than the guest draws it. The hot spot stays where it points. */
-    const int scale = cursor_scale();
-    int x = (int)(where & 0xffff) - cursor_hot_x * scale, y = (int)(where >> 16) - cursor_hot_y * scale;
-    int cw = (int)cursor_w * scale, ch = (int)cursor_h * scale;
+    HvCursorPlan c = cursor_plan_now(lite, w, h, where, cursor_w, cursor_h, cursor_hot_x, cursor_hot_y);
+    const int scale = (int)c.scale;
+    int x = c.x, y = c.y, cw = (int)c.w, ch = (int)c.h;
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
     int x1 = x + cw > (int)w ? (int)w : x + cw, y1 = y + ch > (int)h ? (int)h : y + ch;
     if (x1 <= x0 || y1 <= y0) return;
@@ -2127,9 +2137,8 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         const uint8_t *page = hv_pvg_lite_display_page(lite);
         uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
         if (ctex && where != 0xffffffff && (shown || page[0xe04])) {
-            const float scale = cursor_scale();
-            float x = (float)(where & 0xffff) - hx * scale, y = (float)(where >> 16) - hy * scale;
-            float cw = cw0 * scale, ch = ch0 * scale;
+            HvCursorPlan c = cursor_plan_now(lite, W, H, where, cw0, ch0, hx, hy);
+            float x = c.x, y = c.y, cw = c.w, ch = c.h;
             float r[4] = {x / W * 2 - 1, 1 - (y + ch) / H * 2, cw / W * 2, ch / H * 2};
             [e setRenderPipelineState:cursor_pipe];
             [e setVertexBytes:r length:sizeof r atIndex:0];

@@ -34,4 +34,29 @@ static inline HvPresentPlan hv_present_plan(uint32_t frame_w, uint32_t frame_h, 
     return p;
 }
 
+/* Where the pointer's image lands on a guest frame, in frame pixels. macOS reports the pointer
+   (display page +0xe00) in the pixels of the mode it accepted, which can be bigger than the frame
+   it scans out: on a 4K monitor it accepts 3840 x 2160 and keeps a 1920 x 1080 desktop, so the
+   position is taken from mode pixels to frame pixels. The glyph comes at the frame's own scale:
+   on a monitor it is drawn as it is, on the phone phone_scale times bigger (a 1080p desktop shrunk
+   onto a phone would make it a few dots across), the hot spot kept where it points. */
+typedef struct {
+    int x, y;              /* the image's top-left corner; may be off the frame */
+    uint32_t w, h, scale;  /* its size, the glyph times scale */
+} HvCursorPlan;
+
+static inline HvCursorPlan hv_cursor_plan(uint32_t frame_w, uint32_t frame_h, uint32_t mode_w, uint32_t mode_h,
+                                          uint32_t at_x, uint32_t at_y, uint32_t glyph_w, uint32_t glyph_h,
+                                          int hot_x, int hot_y, int external, uint32_t phone_scale) {
+    HvCursorPlan c;
+    if (mode_w && mode_h) { /* unknown: already frame pixels */
+        at_x = (uint32_t)((uint64_t)at_x * frame_w / mode_w);
+        at_y = (uint32_t)((uint64_t)at_y * frame_h / mode_h);
+    }
+    c.scale = external ? 1 : phone_scale;
+    c.x = (int)at_x - hot_x * (int)c.scale, c.y = (int)at_y - hot_y * (int)c.scale;
+    c.w = glyph_w * c.scale, c.h = glyph_h * c.scale;
+    return c;
+}
+
 #endif
