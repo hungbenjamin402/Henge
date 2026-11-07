@@ -43,6 +43,7 @@ static int cursor_scale(void) {
 #include <string.h>
 
 #include "pvg_lite.h"
+#include "pvg_present.h"
 
 #if !TARGET_OS_IPHONE
 #import <CoreGraphics/CoreGraphics.h>
@@ -153,7 +154,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     __weak CAMetalLayer *prepared_layer; /* presenter only: each target needs its own setup */
     id<MTLRenderPipelineState> screen_pipe, linear_pipe, cursor_pipe;
     id<MTLTexture> cursor_tex;
-    id<MTLSamplerState> screen_sampler, cursor_sampler;
+    id<MTLSamplerState> screen_sampler, screen_sampler_nearest, cursor_sampler; /* linear for a resized frame, nearest for one that lands whole; the pointer's */
     uint64_t on_screen; /* the mapping showing */
     _Atomic uint64_t gpu_frames;
     dispatch_queue_t presenter;
@@ -1923,8 +1924,9 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
         screen_sampler = [device newSamplerStateWithDescriptor:sd];
         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+        screen_sampler_nearest = [device newSamplerStateWithDescriptor:sd];
         cursor_sampler = [device newSamplerStateWithDescriptor:sd];
-        if (!screen_pipe || !linear_pipe || !cursor_pipe || !screen_sampler || !cursor_sampler) { [self complain:[NSString stringWithFormat:@"screen pipelines: %@", err.localizedDescription]]; return NO; }
+        if (!screen_pipe || !linear_pipe || !cursor_pipe || !screen_sampler || !screen_sampler_nearest || !cursor_sampler) { [self complain:[NSString stringWithFormat:@"screen pipelines: %@", err.localizedDescription]]; return NO; }
     }
     // Pipelines are shared, but a newly connected monitor has a fresh layer.
     if (prepared_layer != target) {
@@ -2032,7 +2034,19 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             if (changed) continue;
             return;
         }
-        CGSize want = CGSizeMake(W, H);
+        /* The drawable is the screen's own pixels (Apple: render at the display's exact pixel size, never
+           to be resampled) and the frame is aspect-fit inside it, nearest when it lands whole (pvg_present.h).
+           The probes read the frame's pixels back out of the drawable, so for them it stays the frame's size. */
+        static int probing = -1;
+        if (probing < 0) probing = getenv("HV_PVG_GPU_TEST") != NULL || getenv("HV_COLOR_PROBE") != NULL;
+        uint32_t screen_px_w = 0, screen_px_h = 0;
+        if (!probing) {
+            CGSize bounds = target.bounds.size;
+            CGFloat scale = target.contentsScale;
+            screen_px_w = (uint32_t)(bounds.width * scale + 0.5), screen_px_h = (uint32_t)(bounds.height * scale + 0.5);
+        }
+        HvPresentPlan plan = hv_present_plan(W, H, screen_px_w, screen_px_h);
+        CGSize want = CGSizeMake(plan.drawable_w, plan.drawable_h);
         if (!CGSizeEqualToSize(target.drawableSize, want)) {
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
@@ -2092,16 +2106,19 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = drawable.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        BOOL bars = plan.w != plan.drawable_w || plan.h != plan.drawable_h; /* black around a frame of another shape */
+        pass.colorAttachments[0].loadAction = bars ? MTLLoadActionClear : MTLLoadActionDontCare;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass];
+        [e setViewport:(MTLViewport){plan.x, plan.y, plan.w, plan.h, 0, 1}]; /* the cursor's clip-space maths below holds within it */
         NSNumber *linearSetting = [[NSUserDefaults standardUserDefaults] objectForKey:@"henge.display.linearToSRGB"];
         BOOL convertLinear = linearSetting ? linearSetting.boolValue : YES;
         [e setRenderPipelineState:(half && convertLinear) ? linear_pipe : screen_pipe];
         float rect[4] = {-1, -1, 2, 2};
         [e setVertexBytes:rect length:sizeof rect atIndex:0];
         [e setFragmentTexture:tex atIndex:0];
-        [e setFragmentSamplerState:screen_sampler atIndex:0];
+        [e setFragmentSamplerState:plan.nearest ? screen_sampler_nearest : screen_sampler atIndex:0];
         if (half) {
             uint32_t half_mode = (uint32_t)hv_half_mode_get();
             [e setFragmentBytes:&half_mode length:sizeof half_mode atIndex:0];
